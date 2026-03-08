@@ -1,0 +1,86 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  
+  "model": "google/gemini-2.5-flash",
+  "default_agent": "chat-bridge",
+  
+  "plugin": [],
+  
+  "mode": {
+    "build": { "prompt": "" },
+    "plan": { "prompt": "" }
+  },
+  
+  "mcp": {
+    "chrome-devtools": {
+      "enabled": false
+    },
+    "weather": {
+      "type": "local",
+      "command": ["npx", "-y", "open-meteo-mcp-lite"],
+      "enabled": true
+    }
+  },
+   
+  "agent": {
+    "chat-bridge": {
+      "description": "Secure chat assistant with limited tools - only MCP servers, no filesystem access",
+      "mode": "primary",
+      "prompt": "You are a helpful assistant in a chat interface.\n\nKeep responses SHORT (2-4 paragraphs). If you have more context or details, briefly summarize and offer \"Let me know if you want more details on any of these points.\"\n\nThis is plain text chat - no markdown formatting. Instead of **bold**, `code`, ## headers, or - bullets, use:\n- Line breaks to separate ideas\n- 1) 2) 3) for numbered lists\n- CAPS for emphasis\n\nUse available tools when helpful.",
+      
+      "permission": {
+        "read": "allow",
+        "write": "deny",
+        "edit": "deny",
+        "glob": "allow",
+        "grep": "allow",
+        "bash": "allow",
+        "task": "deny",
+        "todowrite": "deny",
+        "todoread": "deny",
+        "webfetch": "allow",
+        "codesearch": "allow",
+        "question": "allow",
+        "skill": "allow",
+        
+        "chrome-devtools_*": "deny",
+        
+        "time_get_current_time": "allow",
+        "time_convert_time": "allow",
+        
+        "weather_get_weather": "allow",
+        "weather_get_forecast": "allow",
+        "weather_search_location": "allow",
+        "weather_set_default_location": "allow",
+        "weather_get_default_location": "allow",
+        
+        "web-search_full-web-search": "allow",
+        "web-search_get-web-search-summaries": "allow",
+        "web-search_get-single-web-page-content": "allow",
+        
+        "search_web": "allow",
+        "read_url_content": "allow",
+        
+        "doclibrary_search_documents": "allow",
+        "doclibrary_search_visual_elements": "allow",
+        "doclibrary_list_elements": "allow",
+        "doclibrary_get_element_details": "allow",
+        "doclibrary_list_documents": "allow",
+        "doclibrary_get_library_status": "allow",
+        "doclibrary_get_document_info": "allow",
+        "doclibrary_find_document": "allow",
+        "doclibrary_list_documents_paginated": "allow",
+        
+        "doclibrary_get_page_path": "allow",
+        "doclibrary_get_element_path": "allow",
+        "doclibrary_get_page_metadata": "allow",
+        
+        "doclibrary_get_page_image": "deny",
+        "doclibrary_get_element_image": "deny"
+      }
+    }
+  },
+  
+  "permission": {
+  }
+}

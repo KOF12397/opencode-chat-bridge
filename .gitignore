@@ -1,0 +1,51 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+config.json
+!config.example.json
+
+# OpenCode local config (may contain secrets from MCP environment blocks)
+opencode.json
+!opencode.example.json
+
+# OpenCode local data
+.opencode/
+
+# Bun
+bun.lockb
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+logs/
+*.log
+
+# Matrix crypto store (contains sensitive keys)
+matrix-store/
+nio_store/
+
+# Python cache
+.ruff_cache/
+__pycache__/
+*.pyc
+
+# whatsapp (contains sensitive keys)
+.whatsapp-auth/
+
+# Bot session storage (separate from dev sessions)
+.sessions/

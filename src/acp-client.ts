@@ -1,0 +1,582 @@
+/**
+ * ACP Client - Handles communication with OpenCode via ACP protocol
+ */
+
+import { spawn, type ChildProcess } from "child_process"
+import { EventEmitter } from "events"
+import { existsSync } from "fs"
+import { homedir } from "os"
+import { join } from "path"
+
+// Find the opencode executable
+function findOpencode(): string {
+  // Check environment variable first
+  if (process.env.OPENCODE_PATH && existsSync(process.env.OPENCODE_PATH)) {
+    return process.env.OPENCODE_PATH
+  }
+  
+  // Common installation paths
+  const paths = [
+    join(homedir(), ".opencode", "bin", "opencode"),
+    "/usr/local/bin/opencode",
+    "/usr/bin/opencode",
+  ]
+  
+  for (const p of paths) {
+    if (existsSync(p)) {
+      return p
+    }
+  }
+  
+  // Fall back to PATH lookup
+  return "opencode"
+}
+
+export interface ACPClientOptions {
+  cwd?: string
+  mcpServers?: MCPServer[]
+}
+
+export interface MCPServer {
+  name: string
+  command: string
+  args: string[]
+  env?: string[]
+}
+
+export interface SessionUpdate {
+  type: "text" | "thought" | "tool_call" | "tool_result" | "error" | "done"
+  content?: string
+  toolName?: string
+  toolArgs?: any
+  toolResult?: string
+}
+
+// Activity events for UX logging (tool calls, searches, etc.)
+export interface ActivityEvent {
+  type: "tool_start" | "tool_end" | "searching" | "fetching" | "processing"
+  tool?: string
+  message: string
+  details?: any
+}
+
+// Image content from tool results
+export interface ImageContent {
+  type: "image"
+  mimeType: string
+  data: string  // base64 encoded
+  alt?: string
+}
+
+// OpenCode command definition
+export interface OpenCodeCommand {
+  name: string
+  description: string
+}
+
+export class ACPClient extends EventEmitter {
+  private acp: ChildProcess | null = null
+  private requestId = 0
+  private pending = new Map<number, (msg: any) => void>()
+  private buffer = ""
+  private sessionId: string | null = null
+  private cwd: string
+  private mcpServers: MCPServer[]
+  private _availableCommands: OpenCodeCommand[] = []
+  // Track cumulative output per tool call to compute actual deltas
+  private toolOutputSeen = new Map<string, number>()
+  
+  constructor(options: ACPClientOptions = {}) {
+    super()
+    this.cwd = options.cwd || process.cwd()
+    this.mcpServers = options.mcpServers || []
+  }
+  
+  /**
+   * Get the list of commands available in OpenCode
+   * Populated from available_commands_update after session creation
+   */
+  get availableCommands(): OpenCodeCommand[] {
+    return this._availableCommands
+  }
+  
+  /**
+   * Check if a command name is available in OpenCode
+   * @param name Command name without leading slash (e.g., "init", "compact")
+   */
+  hasCommand(name: string): boolean {
+    return this._availableCommands.some(cmd => cmd.name === name)
+  }
+  
+  async connect(): Promise<void> {
+    const opencodePath = findOpencode()
+    console.log(`[ACP] Using opencode at: ${opencodePath}`)
+    
+    this.acp = spawn(opencodePath, ["acp"], {
+      stdio: ["pipe", "pipe", "pipe"],
+      cwd: this.cwd,
+    })
+    
+    this.acp.stdout!.on("data", (data) => this.handleData(data))
+    this.acp.stderr!.on("data", (data) => {
+      const text = data.toString()
+      if (!text.includes("Error handling")) {
+        this.emit("error", text)
+      }
+    })
+    this.acp.on("close", (code) => this.emit("close", code))
+    
+    // Wait for process to start
+    await this.sleep(300)
+    
+    // Initialize
+    const initResult = await this.send("initialize", { protocolVersion: 1 })
+    if (initResult.error) {
+      throw new Error(`Initialize failed: ${JSON.stringify(initResult.error)}`)
+    }
+    
+    this.emit("connected", initResult.result?.agentInfo)
+  }
+  
+  async createSession(): Promise<string> {
+    const result = await this.send("session/new", {
+      cwd: this.cwd,
+      mcpServers: this.mcpServers,
+    })
+    
+    if (result.error || !result.result?.sessionId) {
+      throw new Error(`Session creation failed: ${JSON.stringify(result.error)}`)
+    }
+    
+    this.sessionId = result.result.sessionId
+    
+    // Emit the current mode (agent) from session result
+    const currentMode = result.result?.modes?.currentModeId
+    if (currentMode) {
+      this.emit("agent-set", currentMode)
+    }
+    
+    // Wait for MCP servers to initialize
+    await this.sleep(1000)
+    
+    return this.sessionId!
+  }
+  
+  async prompt(text: string, options: { agent?: string } = {}): Promise<string> {
+    if (!this.sessionId) {
+      await this.createSession()
+    }
+    
+    let responseText = ""
+    let currentThought = ""
+    
+    // Set up update listener for this prompt
+    const updateHandler = (update: SessionUpdate) => {
+      if (update.type === "text") {
+        responseText += update.content || ""
+      } else if (update.type === "thought") {
+        currentThought += update.content || ""
+      }
+    }
+    
+    this.on("update", updateHandler)
+    
+    const params: any = {
+      sessionId: this.sessionId,
+      prompt: [{ type: "text", text }],
+    }
+    
+    if (options.agent) {
+      params.agent = options.agent
+    }
+    
+    await this.send("session/prompt", params)
+    
+    this.off("update", updateHandler)
+    
+    return responseText
+  }
+  
+  async disconnect(): Promise<void> {
+    if (this.acp) {
+      this.acp.kill()
+      this.acp = null
+    }
+    this.sessionId = null
+  }
+  
+  private send(method: string, params: any = {}): Promise<any> {
+    return new Promise((resolve) => {
+      const id = ++this.requestId
+      const msg = { jsonrpc: "2.0", id, method, params }
+      this.pending.set(id, resolve)
+      this.acp!.stdin!.write(JSON.stringify(msg) + "\n")
+    })
+  }
+  
+  private handleData(data: Buffer): void {
+    this.buffer += data.toString()
+    const lines = this.buffer.split("\n")
+    this.buffer = lines.pop() || ""
+    
+    for (const line of lines) {
+      if (!line.trim()) continue
+      try {
+        const msg = JSON.parse(line)
+        this.handleMessage(msg)
+      } catch {}
+    }
+  }
+  
+  private handleMessage(msg: any): void {
+
+    
+    // Handle notifications
+    if (msg.method === "session/update") {
+      this.handleSessionUpdate(msg.params)
+      return
+    }
+    
+    // Handle permission requests - auto-reject with message
+    if (msg.method === "session/request_permission") {
+      this.handlePermissionRequest(msg)
+      return
+    }
+    
+    // Handle responses
+    if (msg.id && this.pending.has(msg.id)) {
+      const resolve = this.pending.get(msg.id)!
+      this.pending.delete(msg.id)
+      resolve(msg)
+    }
+  }
+  
+private handlePermissionRequest(msg: any): void {  
+  const params = msg.params  
+  const toolCall = params.toolCall || {}  
+  const title = toolCall.title || params.title || "unknown"  
+  const rawInput = toolCall.rawInput || {}  
+    
+  // Path can be in many places - check all possibilities  
+  const path = rawInput.filepath || rawInput.filePath || rawInput.path ||  
+               rawInput.directory || rawInput.dir ||  
+               toolCall.locations?.[0]?.path ||  
+               params.path || params.directory ||  
+               // Last resort: stringify rawInput if not empty  
+               (Object.keys(rawInput).length > 0   
+                 ? JSON.stringify(rawInput).slice(0, 100)   
+                 : null)  
+    
+  // Check if path is in .opencode directory  
+  const isOpencodePath = path && (  
+    path.includes('.opencode/') ||   
+    path.includes('/.opencode') ||  
+    path.startsWith('.opencode/') ||  
+    path.endsWith('/.opencode')  
+  )  
+    
+  if (isOpencodePath) {  
+    // Allow access to .opencode directory  
+    const response = {  
+      jsonrpc: "2.0",  
+      id: msg.id,  
+      result: {  
+        outcome: {  
+          outcome: "selected",  
+          optionId: "allow",  
+        },  
+      },  
+    }  
+    this.acp!.stdin!.write(JSON.stringify(response) + "\n")  
+    return  
+  }  
+    
+  // Format message - if no path available, just show the permission type  
+  const displayPath = path || title  
+    
+  console.error(`[ACP] Permission requested: ${title} - auto-rejecting`)  
+    
+  // Emit an event so the connector can show the user what happened  
+  // Only show path if it's different from the permission type  
+  const showPath = path && path !== title  
+  this.emit("permission_rejected", {  
+    permission: title,  
+    path: path || null,  
+    message: showPath ? `Permission denied: ${title} (${path})` : `Permission denied: ${title}`,  
+  })  
+    
+  // Send rejection response  
+  const response = {  
+    jsonrpc: "2.0",  
+    id: msg.id,  
+    result: {  
+      outcome: {  
+        outcome: "selected",  
+        optionId: "reject",  
+      },  
+    },  
+  }  
+  this.acp!.stdin!.write(JSON.stringify(response) + "\n")  
+}
+  
+  private handleSessionUpdate(params: any): void {
+    const update = params.update
+    
+
+    
+    switch (update.sessionUpdate) {
+      case "agent_message_chunk":
+        if (update.content?.type === "text") {
+          this.emit("update", { type: "text", content: update.content.text })
+          this.emit("chunk", update.content.text)
+        }
+        // Handle image content in messages
+        if (update.content?.type === "image") {
+          this.emit("image", {
+            type: "image",
+            mimeType: update.content.mimeType || "image/png",
+            data: update.content.data,
+            alt: update.content.alt,
+          })
+        }
+        break
+        
+      case "agent_thought_chunk":
+        if (update.content?.type === "text") {
+          this.emit("update", { type: "thought", content: update.content.text })
+        }
+        break
+        
+      case "tool_call":
+        // Initial tool call - just note it's pending
+        // Args come in tool_call_update with status: "in_progress"
+        const toolNameInit = update.title || update.name || "unknown"
+        this.emit("tool", { name: toolNameInit, status: "pending", args: {} })
+        break
+        
+      case "tool_call_update":
+        const toolNameUpdate = update.title || update.name || "unknown"
+        let toolArgsUpdate = update.rawInput || {}
+        
+        // Parse if string
+        if (typeof toolArgsUpdate === "string") {
+          try {
+            toolArgsUpdate = JSON.parse(toolArgsUpdate)
+          } catch {
+            toolArgsUpdate = { raw: toolArgsUpdate }
+          }
+        }
+        
+        // Emit activity when we get the args (in_progress status)
+        if (update.status === "in_progress") {
+          this.emit("update", {
+            type: "tool_call",
+            toolName: toolNameUpdate,
+            toolArgs: toolArgsUpdate,
+          })
+          this.emit("tool", { name: toolNameUpdate, status: update.status, args: toolArgsUpdate })
+          
+          // Emit human-readable activity event with actual tool name for transparency
+          const activity = this.formatToolActivity(toolNameUpdate, toolArgsUpdate, "start")
+          this.emit("activity", {
+            type: "tool_start",
+            tool: activity.toolName,
+            message: `${activity.description} [${activity.toolName}]`,
+            description: activity.description,
+            details: toolArgsUpdate,
+          })
+          
+          // Stream partial output if available (e.g., bash stdout during execution)
+          // rawOutput.output is CUMULATIVE - compute actual delta
+          if (update.rawOutput?.output) {
+            const fullOutput = update.rawOutput.output
+            const toolCallId = update.toolCallId || toolNameUpdate
+            const seenLength = this.toolOutputSeen.get(toolCallId) || 0
+            
+            // Only emit new content (the delta)
+            if (fullOutput.length > seenLength) {
+              const delta = fullOutput.slice(seenLength)
+              this.toolOutputSeen.set(toolCallId, fullOutput.length)
+              
+              this.emit("update", {
+                type: "tool_output_delta",
+                toolName: toolNameUpdate,
+                toolCallId: update.toolCallId,
+                partialOutput: delta,
+              })
+              this.emit("tool_output_delta", {
+                tool: toolNameUpdate,
+                toolCallId: update.toolCallId,
+                output: delta,
+              })
+            }
+          }
+        }
+        
+        // Handle completed status with result
+        if (update.status === "completed") {
+          // Clean up output tracking for this tool call
+          const toolCallId = update.toolCallId || toolNameUpdate
+          this.toolOutputSeen.delete(toolCallId)
+          
+          // Get result from content or rawOutput
+          let result = ""
+          if (update.content && Array.isArray(update.content)) {
+            for (const item of update.content) {
+              if (item.content?.type === "text") {
+                result += item.content.text
+              }
+              if (item.content?.type === "image") {
+                this.emit("image", {
+                  type: "image",
+                  mimeType: item.content.mimeType || "image/png",
+                  data: item.content.data,
+                  alt: item.content.alt,
+                })
+              }
+            }
+          } else if (update.rawOutput?.output) {
+            result = update.rawOutput.output
+          }
+          
+          if (result) {
+            this.emit("update", {
+              type: "tool_result",
+              toolName: toolNameUpdate,
+              toolCallId: update.toolCallId,
+              toolResult: result,
+            })
+            
+            // Check if result contains image data
+            this.parseToolResultForImages(result)
+          }
+          
+          // Emit activity end
+          this.emit("activity", {
+            type: "tool_end",
+            tool: toolNameUpdate,
+            message: "Done",
+          })
+        }
+        
+        // Handle failed status (blocked or error)
+        if (update.status === "failed") {
+          // Clean up output tracking for this tool call
+          const failedToolCallId = update.toolCallId || toolNameUpdate
+          this.toolOutputSeen.delete(failedToolCallId)
+          
+          let errorMsg = "Tool execution failed"
+          if (update.content && Array.isArray(update.content)) {
+            for (const item of update.content) {
+              if (item.content?.type === "text") {
+                errorMsg = item.content.text
+              }
+            }
+          } else if (update.rawOutput?.error) {
+            errorMsg = update.rawOutput.error
+          }
+          
+          this.emit("update", {
+            type: "tool_result",
+            toolName: toolNameUpdate,
+            toolCallId: update.toolCallId,
+            toolResult: `[Error] ${errorMsg}`,
+          })
+          
+          // Emit activity end with error
+          this.emit("activity", {
+            type: "tool_end",
+            tool: toolNameUpdate,
+            message: "Failed",
+          })
+        }
+        break
+        
+      case "available_commands_update":
+        // Store OpenCode's available commands
+        if (update.availableCommands && Array.isArray(update.availableCommands)) {
+          this._availableCommands = update.availableCommands.map((cmd: any) => ({
+            name: cmd.name,
+            description: cmd.description || "",
+          }))
+          this.emit("commands_updated", this._availableCommands)
+        }
+        break
+    }
+  }
+  
+  // Format tool calls into human-readable activity messages
+  // Generic: shows tool name and compact args for any tool
+  private formatToolActivity(tool: string, args: any, phase: "start" | "end"): { description: string; toolName: string } {
+    if (phase === "end") return { description: "Done", toolName: tool }
+    
+    // Format args compactly - show key=value pairs, truncate long values
+    const formatArgs = (obj: any): string => {
+      if (!obj || typeof obj !== "object") return ""
+      const pairs = Object.entries(obj)
+        .filter(([_, v]) => v !== undefined && v !== null && v !== "")
+        .map(([k, v]) => {
+          const val = typeof v === "string" 
+            ? (v.length > 40 ? v.slice(0, 40) + "..." : v)
+            : JSON.stringify(v)
+          return `${k}=${val}`
+        })
+        .slice(0, 3)  // Max 3 params
+      return pairs.join(", ")
+    }
+    
+    const argsStr = formatArgs(args)
+    const description = argsStr ? argsStr : ""
+    
+    return { description, toolName: tool }
+  }
+  
+  // Parse tool results for embedded images (base64)
+  private parseToolResultForImages(result: string): void {
+    try {
+      const parsed = JSON.parse(result)
+      
+      // Handle array of content items (common MCP pattern)
+      if (Array.isArray(parsed)) {
+        for (const item of parsed) {
+          if (item.type === "image" && item.data) {
+            this.emit("image", {
+              type: "image",
+              mimeType: item.mimeType || "image/png",
+              data: item.data,
+              alt: item.alt,
+            })
+          }
+        }
+      }
+      // Handle direct image object
+      else if (parsed.type === "image" && parsed.data) {
+        this.emit("image", {
+          type: "image",
+          mimeType: parsed.mimeType || "image/png",
+          data: parsed.data,
+          alt: parsed.alt,
+        })
+      }
+      // Handle nested content array
+      else if (parsed.content && Array.isArray(parsed.content)) {
+        for (const item of parsed.content) {
+          if (item.type === "image" && item.data) {
+            this.emit("image", {
+              type: "image",
+              mimeType: item.mimeType || "image/png",
+              data: item.data,
+              alt: item.alt,
+            })
+          }
+        }
+      }
+    } catch {
+      // Not JSON or no images, ignore
+    }
+  }
+  
+  private sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms))
+  }
+}
