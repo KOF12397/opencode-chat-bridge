@@ -12,7 +12,7 @@ on:
 
 env:
   REGISTRY: docker.io
-  IMAGE_NAME: kof12397/opencode-chat-bridge
+  IMAGE_NAME: kof0098c/opencode-chat-bridge
 
 jobs:
   build:
