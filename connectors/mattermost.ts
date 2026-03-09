@@ -1,19 +1,19 @@
 #!/usr/bin/env bun
 /**
  * Mattermost Connector for OpenCode Chat Bridge
- * 
+ *
  * Bridges Mattermost channels to OpenCode via ACP protocol.
  * Uses Mattermost REST API v4 + WebSocket for real-time events.
  * Zero external dependencies -- uses native fetch and WebSocket.
- * 
+ *
  * Usage:
  *   bun connectors/mattermost.ts
- * 
+ *
  * Environment variables:
  *   MATTERMOST_URL    - Server URL (e.g., https://mattermost.example.com)
  *   MATTERMOST_TOKEN  - Bot access token (from Integrations > Bot Accounts)
  *   MATTERMOST_TEAM   - Team name/slug (optional, auto-detected if bot is in one team)
- * 
+ *
  * Or configure via chat-bridge.json under the "mattermost" key.
  */
 
@@ -58,6 +58,7 @@ async function mmApi(method: string, endpoint: string, body?: any): Promise<any>
       "Content-Type": "application/json",
     },
   }
+  
   if (body) {
     opts.body = JSON.stringify(body)
   }
@@ -220,8 +221,7 @@ class MattermostConnector extends BaseConnector<ChannelSession> {
 
   private async connectWebSocket(): Promise<void> {
     return new Promise((resolve, reject) => {
-      const wsUrl = MM_URL.replace(/^https/, "wss").replace(/^http/, "ws")
-        + "/api/v4/websocket"
+      const wsUrl = MM_URL.replace(/^https/, "wss").replace(/^http/, "ws") + "/api/v4/websocket"
 
       this.log(`Connecting WebSocket: ${wsUrl}`)
       this.ws = new WebSocket(wsUrl)
@@ -329,7 +329,7 @@ class MattermostConnector extends BaseConnector<ChannelSession> {
 
       const channelId = post.channel_id
       const message = (post.message || "").trim()
-      if (!message) return
+      // 移除了：if (!message) return  // 允许没有文本的消息（纯文件/图片）
 
       // Check if this is a DM channel
       const channelType = data.data.channel_type || ""
@@ -344,22 +344,58 @@ class MattermostConnector extends BaseConnector<ChannelSession> {
       // Get sender username for logging
       const senderName = data.data.sender_name || post.user_id
 
-      this.log(`[MSG] ${senderName}: ${message}`)
+      this.log(`[MSG] ${senderName}: ${message || "(no text)"}`)
+
+      // 处理文件附件
+      let fileAttachments = ""
+      if (post.file_ids && post.file_ids.length > 0) {
+        for (const fileId of post.file_ids) {
+          try {
+            // 获取文件信息
+            const fileInfo = await mmApi("GET", `/files/${fileId}/info`)
+            // 下载文件内容
+            const fileContent = await mmApi("GET", `/files/${fileId}`)
+            
+            // 保存文件到workspace目录
+            const fileName = fileInfo.name || `file_${fileId}`
+            const filePath = `/workspace/${fileName}`
+            
+            // 如果是图片，保存为二进制；否则保存为文本
+            if (fileInfo.mime_type && fileInfo.mime_type.startsWith("image/")) {
+              // 图片文件处理
+              const buffer = Buffer.from(fileContent, 'binary')
+              fs.writeFileSync(filePath, buffer)
+              fileAttachments += `\n[图片: ${fileName}]`
+            } else {
+              // 其他文件处理
+              fs.writeFileSync(filePath, JSON.stringify(fileContent, null, 2))
+              fileAttachments += `\n[文件: ${fileName}]`
+            }
+          } catch (err) {
+            this.logError(`Failed to download file ${fileId}:`, err)
+          }
+        }
+      }
 
       // Extract query based on trigger, @mention, or DM
-      let query = ""
+      let query = message || ""  // 允许空消息
+      query += fileAttachments
+      
       const mention = `@${this.botUsername}`
-      if (message.startsWith(TRIGGER + " ")) {
+      if (message && message.startsWith(TRIGGER + " ")) {
         query = message.slice(TRIGGER.length + 1).trim()
-      } else if (message.startsWith(TRIGGER)) {
+      } else if (message && message.startsWith(TRIGGER)) {
         query = message.slice(TRIGGER.length).trim()
-      } else if (config.mattermost.respondToMentions && message.startsWith(mention + " ")) {
+      } else if (config.mattermost.respondToMentions && message && message.startsWith(mention + " ")) {
         query = message.slice(mention.length + 1).trim()
-      } else if (config.mattermost.respondToMentions && message.startsWith(mention)) {
+      } else if (config.mattermost.respondToMentions && message && message.startsWith(mention)) {
         query = message.slice(mention.length).trim()
       } else if (isDM) {
         // In DM channels, respond to all messages without trigger
-        query = message
+        query = query  // 包含文件信息
+      } else if (!message && fileAttachments) {
+        // 纯文件消息，直接处理
+        query = fileAttachments.trim()
       } else {
         return
       }
