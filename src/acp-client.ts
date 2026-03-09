@@ -235,7 +235,7 @@ export class ACPClient extends EventEmitter {
       return
     }
 
-    // Handle permission requests - auto-reject with message
+    // Handle permission requests - auto-allow with logging
     if (msg.method === "session/request_permission") {
       this.handlePermissionRequest(msg)
       return
@@ -257,66 +257,37 @@ export class ACPClient extends EventEmitter {
 
     // Path can be in many places - check all possibilities
     const path = rawInput.filepath || rawInput.filePath || rawInput.path ||
-               rawInput.directory || rawInput.dir ||
-               toolCall.locations?.[0]?.path ||
-               params.path || params.directory ||
-               // Last resort: stringify rawInput if not empty
-               (Object.keys(rawInput).length > 0
-                 ? JSON.stringify(rawInput).slice(0, 100)
-                 : null)
-
-    // Check if path is in .opencode directory or workspace directory
-    const isOpencodePath = path && (
-      path.includes('.opencode/') ||
-      path.includes('/.opencode') ||
-      path.startsWith('.opencode/') ||
-      path.endsWith('/.opencode')
-    )
-
-    const isWorkspacePath = path && (
-      path.includes('/workspace/') ||
-      path.startsWith('/workspace') ||
-      path === '/workspace'
-    )
-
-    if (isOpencodePath || isWorkspacePath) {
-      // Allow access to .opencode directory and workspace directory
-      const response = {
-        jsonrpc: "2.0",
-        id: msg.id,
-        result: {
-          outcome: {
-            outcome: "selected",
-            optionId: "allow",
-          },
-        },
-      }
-      this.acp!.stdin!.write(JSON.stringify(response) + "\n")
-      return
-    }
+                 rawInput.directory || rawInput.dir ||
+                 toolCall.locations?.[0]?.path ||
+                 params.path || params.directory ||
+                 // Last resort: stringify rawInput if not empty
+                 (Object.keys(rawInput).length > 0
+                   ? JSON.stringify(rawInput).slice(0, 100)
+                   : null)
 
     // Format message - if no path available, just show the permission type
     const displayPath = path || title
 
-    console.error(`[ACP] Permission requested: ${title} - auto-rejecting`)
+    // 保留审计日志
+    const timestamp = new Date().toISOString()
+    console.log(`[AUDIT] ${timestamp} - Permission requested: ${title} - ALLOWED${path ? ` (${path})` : ''}`)
 
-    // Emit an event so the connector can show the user what happened
-    // Only show path if it's different from the permission type
-    const showPath = path && path !== title
-    this.emit("permission_rejected", {
+    // 发送审计事件（可用于外部日志系统）
+    this.emit("permission_granted", {
       permission: title,
       path: path || null,
-      message: showPath ? `Permission denied: ${title} (${path})` : `Permission denied: ${title}`,
+      timestamp: timestamp,
+      message: `Permission granted: ${title}${path ? ` (${path})` : ''}`,
     })
 
-    // Send rejection response
+    // Send allow response (修改：从 reject 改为 allow)
     const response = {
       jsonrpc: "2.0",
       id: msg.id,
       result: {
         outcome: {
           outcome: "selected",
-          optionId: "reject",
+          optionId: "allow",  // 关键修改：允许所有权限
         },
       },
     }
@@ -418,40 +389,29 @@ export class ACPClient extends EventEmitter {
         // Handle completed status with result
         if (update.status === "completed") {
           // Clean up output tracking for this tool call
-          const toolCallId = update.toolCallId || toolNameUpdate
-          this.toolOutputSeen.delete(toolCallId)
+          const completedToolCallId = update.toolCallId || toolNameUpdate
+          this.toolOutputSeen.delete(completedToolCallId)
 
-          // Get result from content or rawOutput
           let result = ""
           if (update.content && Array.isArray(update.content)) {
             for (const item of update.content) {
               if (item.content?.type === "text") {
                 result += item.content.text
               }
-              if (item.content?.type === "image") {
-                this.emit("image", {
-                  type: "image",
-                  mimeType: item.content.mimeType || "image/png",
-                  data: item.content.data,
-                  alt: item.content.alt,
-                })
-              }
             }
           } else if (update.rawOutput?.output) {
             result = update.rawOutput.output
           }
 
-          if (result) {
-            this.emit("update", {
-              type: "tool_result",
-              toolName: toolNameUpdate,
-              toolCallId: update.toolCallId,
-              toolResult: result,
-            })
+          this.emit("update", {
+            type: "tool_result",
+            toolName: toolNameUpdate,
+            toolCallId: update.toolCallId,
+            toolResult: result,
+          })
 
-            // Check if result contains image data
-            this.parseToolResultForImages(result)
-          }
+          // Check if result contains image data
+          this.parseToolResultForImages(result)
 
           // Emit activity end
           this.emit("activity", {
