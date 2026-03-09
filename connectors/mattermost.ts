@@ -358,7 +358,7 @@ class MattermostConnector extends BaseConnector<ChannelSession> {
             
             // 保存文件到workspace目录
             const fileName = fileInfo.name || `file_${fileId}`
-            const filePath = `/workspace/${fileName}`
+            const filePath = path.join(this.cwd, fileName)
             
             // 如果是图片，保存为二进制；否则保存为文本
             if (fileInfo.mime_type && fileInfo.mime_type.startsWith("image/")) {
