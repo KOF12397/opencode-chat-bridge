@@ -120,7 +120,7 @@ export class ACPClient extends EventEmitter {
     this.acp.stdout!.on("data", (data) => this.handleData(data))
     this.acp.stderr!.on("data", (data) => {
       const text = data.toString()
-      if (!text.includes("Error handling")) {
+      if (!text.includes("Error handling") && !text.includes("database migration")) {
         this.emit("error", text)
       }
     })
